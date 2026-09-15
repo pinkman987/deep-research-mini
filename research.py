@@ -1,222 +1,526 @@
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from search_tool import search, fetch
+
 from llm import ask
+from search_tool import fetch, search
 
 
-# 疑问词/虚词黑名单：这些字只出现在问句里，正文中几乎不会出现，
-# 若计入覆盖率会误杀真正相关的文章（"谁解决了挂谷猜想"教训）
+# 疑问词和虚词黑名单
 STOP = set("谁什么怎么为什么吗呢的了是在有和与及哪些多少如何怎样请问请")
 
 
 def relevant(body, question, ratio=0.3):
-    """关键词覆盖率过滤：只统计问题中的实词字，覆盖 ratio 以上才算相关"""
-    chars = [c for c in question if c not in " ？?，,。、/" and c not in STOP]
+    """使用问题实词字符的覆盖率进行初步相关性过滤。"""
+    chars = [
+        char
+        for char in question
+        if char not in " ？?，,。、/" and char not in STOP
+    ]
+
     if not chars:
-        return True          # 问题全是疑问词时不做过滤，宁可放过
-    hit = sum(1 for c in chars if c in body)
+        return True
+
+    hit = sum(1 for char in chars if char in body)
     return hit >= len(chars) * ratio
 
 
-def _fetch_one(r):
-    """并发抓取的工人函数：线程池里每个线程跑一个它"""
-    final_url, body = fetch(r["url"], retries=1)
-    return r, final_url, body
+def title_key(title):
+    """标题去重键：去掉所有空白，空格差异视为同一篇文章。"""
+    return "".join(title.split())
 
 
-def collect(question, queries, sources, seen, max_new=4, log=print):
-    """搜索+抓取一轮；log 是进度输出函数（终端传 print，网页传界面函数）
-    三个提速手段：
-    1. 摘要预筛：snippet 就不相关的页面根本不抓
-    2. 并发抓取：候选页面同时抓，耗时=最慢的一篇
-    3. 早停：本轮新增够 max_new 篇就不再抓"""
+def _fetch_one(result):
+    """在线程池中抓取一个搜索结果。"""
+    # Tavily 可直接返回提取后的网页正文。优先复用，避免再次访问
+    # 原网站时遇到反爬、超时或内容动态加载。
+    raw_content = result.get("raw_content", "").strip()
+    if len(raw_content) > 200:
+        return result, result["url"], raw_content
+
+    final_url, body = fetch(result["url"], retries=1)
+    return result, final_url, body
+
+
+def collect(
+    question,
+    queries,
+    sources,
+    seen,
+    max_new=4,
+    log=print,
+):
+    """执行一轮搜索和网页抓取。"""
     round_start = len(sources)
-    for q in queries:
+
+    for query in queries:
         if len(sources) - round_start >= max_new:
             log("  本轮材料已够，提前停止抓取")
             break
-        hits = search(q, max_results=8)
-        log(f"  搜索「{q}」得到 {len(hits)} 条结果")
+
+        hits = search(query, max_results=8)
+        log(f"  搜索「{query}」得到 {len(hits)} 条结果")
+
         if not hits:
             time.sleep(2)
-            hits = search(q, max_results=8)
+            hits = search(query, max_results=8)
             log(f"  重试得到 {len(hits)} 条结果")
-        # 预筛：标题去重 + 摘要相关性，筛出值得抓的候选
+
         candidates = []
-        for r in hits:
-            key = "".join(r["title"].split())
+
+        for result in hits:
+            key = title_key(result["title"])
+
             if key in seen:
-                log(f"  跳过（同一篇文章）: {r['title']}")
+                log(f"  跳过（同一篇文章）: {result['title']}")
                 continue
+
             seen.add(key)
-            if not relevant(r["snippet"] + r["title"], question, ratio=0.3):
-                log(f"  淘汰（摘要就不相关）: {r['title']}")
+
+            preview = result["snippet"] + result["title"]
+
+            if not relevant(preview, question, ratio=0.3):
+                log(f"  淘汰（摘要就不相关）: {result['title']}")
                 continue
-            candidates.append(r)
+
+            candidates.append(result)
+
             if len(candidates) >= max_new:
                 break
+
         if not candidates:
-            # 主源结果全被过滤（索引垃圾）：换备用引擎；
-            # 爬虫搜索引擎对长尾堆词敏感，再截短成前 2 个词重试一次
-            short = " ".join(q.split()[:2])
-            bare = q.split(" site:")[0]            # 去掉站点限定再截短，避免双重限定互相污染
+            # 主搜索源没有可用结果时切换必应。
+            # 同时逐步缩短搜索词，避免长搜索词失效。
+            short_query = " ".join(query.split()[:2])
+            bare_query = query.split(" site:")[0]
+
             retry_queries = []
-            for rq in [q, short, bare, " ".join(bare.split()[:2])]:
-                if rq not in retry_queries:
-                    retry_queries.append(rq)
-            for rq in retry_queries:
-                log(f"  换必应重搜「{rq}」")
-                for r in search(rq, max_results=8, engine="bing"):
-                    key = "".join(r["title"].split())
+
+            for retry_query in [
+                query,
+                short_query,
+                bare_query,
+                " ".join(bare_query.split()[:2]),
+            ]:
+                if retry_query and retry_query not in retry_queries:
+                    retry_queries.append(retry_query)
+
+            for retry_query in retry_queries:
+                log(f"  换必应重搜「{retry_query}」")
+
+                backup_hits = search(
+                    retry_query,
+                    max_results=8,
+                    engine="bing",
+                )
+
+                for result in backup_hits:
+                    key = title_key(result["title"])
+
                     if key in seen:
                         continue
+
                     seen.add(key)
-                    if not relevant(r["snippet"] + r["title"], question, ratio=0.3):
+
+                    preview = result["snippet"] + result["title"]
+
+                    if not relevant(preview, question, ratio=0.3):
                         continue
-                    candidates.append(r)
+
+                    candidates.append(result)
+
                     if len(candidates) >= max_new:
                         break
+
                 if candidates:
                     break
-        # 并发抓取：4 个线程同时开工
+
+        if not candidates:
+            continue
+
         with ThreadPoolExecutor(max_workers=4) as pool:
-            fetched = list(pool.map(_fetch_one, candidates))
-        for r, final_url, body in fetched:
+            fetched_results = list(
+                pool.map(_fetch_one, candidates)
+            )
+
+        for result, final_url, body in fetched_results:
             if final_url:
-                r = {**r, "url": final_url}     # 引用里存真实网址
+                result = {
+                    **result,
+                    "url": final_url,
+                }
+
             if len(body) <= 200:
-                body = r["snippet"]             # 正文抓不到就退而用搜索摘要
+                body = result["snippet"]
+
             if not relevant(body, question):
-                log(f"  淘汰（相关性不够）: {r['title']}")
+                log(f"  淘汰（相关性不够）: {result['title']}")
                 continue
-            sources.append({**r, "body": body})
-            log(f"  有效材料 +1：{r['title']}（{len(body)} 字）")
+
+            sources.append({
+                **result,
+                "body": body,
+            })
+
+            log(
+                f"  有效材料 +1："
+                f"{result['title']}（{len(body)} 字）"
+            )
+
         time.sleep(0.5)
 
 
+def _normalize_text(text):
+    """去掉空白并转为小写，用于核对证据原文。"""
+    return "".join(str(text).split()).lower()
+
+
 def summarize(question, sources):
-    """让千问读多篇材料，输出带来源编号的要点摘要"""
+    """提取直接回答问题、且能通过原文验证的结论。"""
     materials = ""
-    for i, s in enumerate(sources, 1):
-        materials += f"[{i}] 标题：{s['title']}\n正文：{s['body'][:3000]}\n\n"
+
+    for index, source in enumerate(sources, start=1):
+        materials += (
+            f"[{index}] 标题：{source['title']}\n"
+            f"正文：{source['body'][:3000]}\n\n"
+        )
+
     prompt = (
-        f"问题：{question}\n\n"
-        f"以下是搜索到的材料：\n{materials}"
-        "请从材料中提取能回答问题的要点。要求：\n"
-        "1. 每条要点一行，行末用 [n] 标注它来自第几篇材料；\n"
-        "2. 只使用材料中存在的信息，不得自行编造；\n"
-        "3. 材料不足以回答时，输出：材料不足。"
+        f"研究问题：{question}\n\n"
+        f"以下是搜索到的材料：\n{materials}\n"
+        "请从材料中提取能够直接回答研究问题的结论。\n"
+        "每条结论必须附带来源编号和原文证据。\n\n"
+        "要求：\n"
+        "1. claim只能包含证据原文能够直接支持的内容；\n"
+        "2. evidence必须逐字复制材料中的一段连续原文；\n"
+        "3. 不得添加证据中不存在的数字、型号、日期、标准或因果关系；\n"
+        "4. source_id必须对应材料前面的编号；\n"
+        "5. 最多输出12条结论；\n"
+        "6. 只输出JSON，不要输出Markdown或解释文字；\n"
+        "7. 只提取能够直接回答研究问题的结论；\n"
+        "8. 如果问题询问原因，claim必须明确描述一个"
+        "有证据支持的具体原因；\n"
+        "9. 如果问题询问排查方法，claim必须明确描述一个"
+        "有证据支持的可执行步骤；\n"
+        "10. 仅介绍概念、组成、工作原理或应用场景的"
+        "材料一律忽略；\n"
+        "11. 找不到直接回答问题的证据时，输出："
+        '{"claims":[]}。\n'
+        '输出格式：{"claims":[{"claim":"结论",'
+        '"source_id":1,"evidence":"材料中的连续原文"}]}'
     )
-    return ask(prompt)
+
+    answer = ask(prompt)
+
+    start = answer.find("{")
+    end = answer.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        return "材料不足：模型没有返回可解析的证据结构。"
+
+    try:
+        data = json.loads(answer[start:end + 1])
+    except json.JSONDecodeError:
+        return "材料不足：模型返回的证据JSON格式错误。"
+
+    validated_claims = []
+    seen_claims = set()
+
+    for item in data.get("claims", []):
+        claim = str(item.get("claim", "")).strip()
+        evidence = str(item.get("evidence", "")).strip()
+
+        try:
+            source_id = int(item.get("source_id"))
+        except (TypeError, ValueError):
+            continue
+
+        if not claim or not evidence:
+            continue
+
+        if source_id < 1 or source_id > len(sources):
+            continue
+
+        normalized_evidence = _normalize_text(evidence)
+        normalized_body = _normalize_text(
+            sources[source_id - 1].get("body", "")
+        )
+
+        # 证据过短时容易出现偶然匹配
+        if len(normalized_evidence) < 12:
+            continue
+
+        # 模型返回的证据必须真实存在于抓取正文中
+        if normalized_evidence not in normalized_body:
+            continue
+
+        normalized_claim = _normalize_text(claim)
+
+        if normalized_claim in seen_claims:
+            continue
+
+        seen_claims.add(normalized_claim)
+
+        validated_claims.append(
+            f"- 结论：{claim} [{source_id}]\n"
+            f"  证据原文：{evidence}"
+        )
+
+    if not validated_claims:
+        return "材料不足：没有获得能够直接回答问题并通过原文验证的结论。"
+
+    return "\n".join(validated_claims)
 
 
 def plan_queries(question):
-    """让模型把口语问题转成 2-3 个关键词式搜索词
-    （搜索引擎吃关键词不吃整句，"最近谁获得了菲尔兹奖"会被拆错重点）"""
+    """将用户问题规划为2至3个搜索关键词。"""
     prompt = (
         f"研究问题：{question}\n"
-        "请为这个问题生成 2-3 个搜索引擎搜索词。要求：关键词风格而非整句、"
-        "每个搜索词不超过 3 个词（爬虫搜索引擎对长尾堆词会失效）、"
-        "角度互补（如官方名单/新闻报道/百科解释）、只输出 JSON 字符串数组，"
-        '例如 ["菲尔兹奖 获奖者", "2026 菲尔兹奖"]。'
+        "请为这个问题生成2至3个搜索引擎搜索词。\n"
+        "要求：\n"
+        "1. 使用关键词风格，不要使用完整问句；\n"
+        "2. 每个搜索词不超过3个词；\n"
+        "3. 各搜索词应从不同角度进行检索；\n"
+        "4. 不要在同一个搜索词中使用斜杠连接多个品牌；\n"
+        "5. 涉及技术故障时，优先考虑故障手册、报警代码表、"
+        "厂商说明书等角度；\n"
+        "6. 只输出JSON字符串数组。\n"
+        '示例：["伺服过载 故障手册", "伺服过载 报警代码"]。'
     )
+
     answer = ask(prompt)
-    start, end = answer.find("["), answer.rfind("]")
+    start = answer.find("[")
+    end = answer.rfind("]")
+
     try:
         queries = json.loads(answer[start:end + 1])
+
         if isinstance(queries, list) and queries:
-            return [str(q) for q in queries][:3]
+            cleaned_queries = []
+
+            for query in queries[:3]:
+                query = str(query).strip().replace("/", " ")
+
+                if query:
+                    cleaned_queries.append(query)
+
+            if cleaned_queries:
+                return cleaned_queries
+
     except Exception:
         pass
-    return [question]          # 模型输出格式坏了就退回用原问题
+
+    return [question]
 
 
 def reflect(question, notes):
-    """反思：判断摘要够不够；不够就给出换角度的新搜索词"""
+    """判断当前证据是否足够，并生成新的检索方向。"""
     prompt = (
         f"研究问题：{question}\n\n"
-        f"目前已获得的要点摘要：\n{notes}\n\n"
-        "请判断这些摘要是否足以回答研究问题。\n"
-        '如果足够，只输出：{"done": true, "queries": []}\n'
-        '如果不足，给出 2 个新搜索关键词，要求与之前的搜索角度不同'
-        '（例如在：故障排查手册 / 报警代码表 / 品牌说明书 / 维修论坛经验 之间换角度），格式：'
-        '{"done": false, "queries": ["关键词1", "关键词2"]}\n'
-        "只输出 JSON，不要输出其他任何文字。"
+        f"目前已获得的验证结论：\n{notes}\n\n"
+        "请判断这些结论是否能够直接回答研究问题。\n"
+        "仅有背景概念、组成或工作原理不算足够。\n"
+        '如果足够，只输出：{"done":true,"queries":[]}\n'
+        "如果不足，生成2个新的搜索关键词。\n"
+        "新关键词必须：\n"
+        "1. 与上一轮搜索角度不同；\n"
+        "2. 保留研究问题的核心对象和核心故障词；\n"
+        "3. 优先从故障手册、报警代码表、品牌说明书、"
+        "维修文档等角度搜索；\n"
+        "4. 不要用斜杠连接多个品牌；\n"
+        '输出格式：{"done":false,'
+        '"queries":["关键词1","关键词2"]}\n'
+        "只输出JSON，不要输出其他文字。"
     )
+
     answer = ask(prompt)
-    start, end = answer.find("{"), answer.rfind("}")
-    data = json.loads(answer[start:end + 1])
-    return data.get("done", False), data.get("queries", [])
+    start = answer.find("{")
+    end = answer.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        return False, [question]
+
+    try:
+        data = json.loads(answer[start:end + 1])
+    except json.JSONDecodeError:
+        return False, [question]
+
+    queries = data.get("queries", [])
+
+    if not isinstance(queries, list):
+        queries = []
+
+    cleaned_queries = []
+
+    for query in queries[:2]:
+        query = str(query).strip().replace("/", " ")
+
+        if query:
+            cleaned_queries.append(query)
+
+    return bool(data.get("done", False)), cleaned_queries
+
+
+def validate_citations(report, source_count):
+    """报告级引用一致性校验，返回问题列表（空列表=全部通过）：
+    1. 引用编号不得超出来源总数（模型编造不存在的编号）；
+    2. 每条结论行（列表项）必须至少挂一个引用（无依据结论）。"""
+    issues = []
+    numbers = sorted({int(n) for n in re.findall(r"\[(\d+)\]", report)})
+
+    for number in numbers:
+        if number < 1 or number > source_count:
+            issues.append(
+                f"无效引用编号 [{number}]（来源总数 {source_count}）"
+            )
+
+    for line in report.splitlines():
+        stripped = line.strip()
+        is_bullet = stripped.startswith(("-", "*", "•"))
+        has_citation = re.search(r"\[\d+\]", stripped)
+
+        if is_bullet and len(stripped) > 20 and not has_citation:
+            issues.append(f"无引用结论: {stripped[:30]}...")
+
+    return issues
 
 
 def knowledge_fallback(question):
-    """零材料兜底：明确告知用户"无网络来源"，让模型凭自身知识回答且禁止编造引用
-    （与空编报告的区别：身份和局限说得明明白白）"""
+    """无网络来源时给出带有明确警告的模型知识回答。"""
     prompt = (
         f"问题：{question}\n\n"
-        "未能检索到任何网络材料。请基于你自身的知识回答，并遵守：\n"
-        "1. 第一行必须输出：> ⚠️ 未检索到网络来源，以下内容基于模型自身知识，未经联网核实，仅供参考；\n"
-        "2. 禁止使用任何 [n] 引用编号；\n"
-        "3. 不确定的部分明确说'不确定'。"
+        "未能检索到任何能够回答问题的网络材料。\n"
+        "请基于模型自身知识回答，并严格遵守：\n"
+        "1. 第一行必须输出："
+        "> ⚠️ 未检索到可靠网络来源，以下内容基于模型自身知识，"
+        "未经联网核实，仅供参考；\n"
+        "2. 禁止使用任何[n]引用编号；\n"
+        "3. 禁止编造型号、故障码、日期、标准或具体数值；\n"
+        "4. 不确定的内容必须明确说明不确定。"
     )
+
     return ask(prompt)
 
 
 def write_report(question, notes, sources):
-    """把最终摘要组织成带章节的 Markdown 研究报告"""
-    src_list = "\n".join(
-        f"{i}. {s['title']}  {s['url']}" for i, s in enumerate(sources, 1))
+    """根据已验证的结论生成Markdown研究报告。"""
+    source_list = "\n".join(
+        f"{index}. {source['title']}  {source['url']}"
+        for index, source in enumerate(sources, start=1)
+    )
+
     prompt = (
         f"研究问题：{question}\n\n"
-        f"研究要点（带来源编号）：\n{notes}\n\n"
-        f"来源列表：\n{src_list}\n\n"
-        "请写一份 Markdown 研究简报。要求：\n"
-        "1. 用 ## 标题分成 2-4 个小节（如：常见原因 / 排查思路 / 品牌差异）；\n"
-        "2. 保留结论末尾的 [n] 来源编号；\n"
-        "3. 文末加一节 ## 参考文献，原样列出来源列表。"
+        f"已经通过原文验证的结论与证据：\n{notes}\n\n"
+        f"来源列表：\n{source_list}\n\n"
+        "请根据已经验证的结论撰写Markdown研究简报。\n"
+        "要求：\n"
+        "1. 只能改写给定结论，不得增加结论中没有的新事实；\n"
+        "2. 禁止自行补充数字、型号、日期、标准、故障码或因果关系；\n"
+        "3. 每项事实必须保留对应的[n]来源编号；\n"
+        "4. 证据不足的部分必须明确写为无法确认；\n"
+        "5. 不要把推测写成确定事实；\n"
+        "6. 文末添加## 参考文献，并原样列出来源列表；\n"
+        "7. 如果验证后的材料不能直接回答研究问题，"
+        "只输出“当前材料不足，无法可靠回答”，"
+        "不要撰写背景知识。"
     )
+
     return ask(prompt)
 
 
-def research(question, max_rounds=3, log=print):
-    """主循环：搜索→摘要→反思→（不够就换词再搜）→直到结束或轮数用尽
-    log 参数把进度输出注入进来：命令行传 print，网页传界面函数"""
-    sources, seen, notes = [], set(), ""
+def research(
+    question,
+    max_rounds=3,
+    log=print,
+):
+    """执行搜索、摘要、反思和补充检索循环。"""
+    sources = []
+    seen = set()
+    notes = ""
+
     queries = plan_queries(question)
     log(f"规划搜索词：{queries}")
-    for round_no in range(1, max_rounds + 1):
-        log(f"== 第 {round_no} 轮，搜索词：{queries} ==")
+
+    for round_number in range(1, max_rounds + 1):
+        log(
+            f"== 第 {round_number} 轮，"
+            f"搜索词：{queries} =="
+        )
+
         before = len(sources)
-        collect(question, queries, sources, seen, log=log)
+
+        collect(
+            question,
+            queries,
+            sources,
+            seen,
+            log=log,
+        )
+
         if len(sources) == before:
             log("  本轮零新增，下一轮反思会重新规划搜索词")
+
         if sources:
             notes = summarize(question, sources)
             log(notes[:200] + " ...\n")
-        done, queries = reflect(question, notes)
+
+        done, new_queries = reflect(question, notes)
+
         if done:
             log("模型判断：材料已足够，结束循环")
             break
+
+        if new_queries:
+            queries = new_queries
+        else:
+            queries = [question]
+
         log(f"模型判断：还不够，下一轮搜 {queries}\n")
+
     if not sources:
-        # 硬约束：一篇材料都没有时绝不让模型空编，诚实报告失败
-        return "材料不足：未检索到任何有效网页材料，请更换问法或稍后重试。", []
+        return (
+            "材料不足：未检索到任何有效网页材料，"
+            "请更换问法或稍后重试。",
+            [],
+        )
+
     return notes, sources
 
 
 if __name__ == "__main__":
     import sys
-    # 运行时带问题就用带的，不带就用默认问题
-    question = sys.argv[1] if len(sys.argv) > 1 else "伺服电机过载报警的原因有哪些？"
+
+    question = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "伺服电机过载报警的原因有哪些？"
+    )
+
     notes, sources = research(question)
+
     if not sources:
         report = knowledge_fallback(question)
         print(report)
-        print("\n（注意：未检索到网络来源，以上为模型知识回答，未经联网核实）")
+        print(
+            "\n（注意：未检索到网络来源，"
+            "以上为模型知识回答，未经联网核实）"
+        )
     else:
         report = write_report(question, notes, sources)
-        with open("report.md", "w", encoding="utf-8") as f:
-            f.write(f"# 研究报告：{question}\n\n" + report)
+        issues = validate_citations(report, len(sources))
+
+        if issues:
+            print("\n引用校验发现问题：")
+            for issue in issues:
+                print(" -", issue)
+
+        with open("report.md", "w", encoding="utf-8") as file:
+            file.write(
+                f"# 研究报告：{question}\n\n"
+                + report
+            )
+
         print(report)
         print("\n报告已保存到 report.md")

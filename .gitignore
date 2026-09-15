@@ -2,4 +2,5 @@
 __pycache__/
 *.pyc
 my_key.txt
+tavily_key.txt
 .idea/

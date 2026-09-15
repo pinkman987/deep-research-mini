@@ -1,5 +1,10 @@
 import streamlit as st
-from research import research, write_report, knowledge_fallback
+from research import (
+    knowledge_fallback,
+    research,
+    validate_citations,
+    write_report,
+)
 
 st.set_page_config(page_title="DeepResearch-mini", page_icon="🔍", layout="wide")
 st.title("🔍 DeepResearch-mini · 自主搜索型研究 Agent")
@@ -24,7 +29,10 @@ if st.button("开始研究", type="primary", disabled=not question.strip()):
         st.markdown(knowledge_fallback(question))
     else:
         report = write_report(question, notes, sources)
+        issues = validate_citations(report, len(sources))
         st.success(f"研究完成，共引用 {len(sources)} 篇来源")
+        if issues:
+            st.warning("引用校验警告：" + "；".join(issues))
         st.markdown(report)
         st.download_button("下载报告 report.md", report.encode("utf-8"),
                            file_name="report.md", mime="text/markdown")
