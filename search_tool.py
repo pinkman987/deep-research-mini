@@ -132,6 +132,9 @@ def _search_sogou(query, max_results):
         timeout=10,
     )
     response.raise_for_status()
+    # 反爬可能返回 200 的验证页/降级页，识别后当作失败以触发兜底引擎
+    if "antispider" in response.url or "antispider" in response.text[:2000]:
+        raise RuntimeError("sogou 返回反爬验证页")
     return _parse_sogou(response.text, max_results)
 
 
@@ -197,6 +200,9 @@ def fetch(url, retries=2):
                 headers=HEADERS,
             )
             response.raise_for_status()
+            # 部分站点声明错误字符集，按探测编码解码避免乱码正文
+            if not response.encoding or response.encoding.lower() == "iso-8859-1":
+                response.encoding = response.apparent_encoding
             body = trafilatura.extract(
                 response.text,
                 include_comments=False,

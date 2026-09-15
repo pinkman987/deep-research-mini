@@ -11,8 +11,15 @@ from search_tool import fetch, search
 STOP = set("谁什么怎么为什么吗呢的了是在有和与及哪些多少如何怎样请问请")
 
 
+def _char_bigrams(text):
+    """相邻两字切片：捕捉'日企'vs'日资企业'这类同义变体的局部重合。"""
+    compact = "".join(str(text).split())
+    return {compact[i:i + 2] for i in range(len(compact) - 1)}
+
+
 def relevant(body, question, ratio=0.3):
-    """使用问题实词字符的覆盖率进行初步相关性过滤。"""
+    """相关性过滤：单字覆盖率与字符二元组覆盖率取较高者过阈。
+    单字层防漏（字面重合），二元组层防同义变体误杀（局部词重合）。"""
     chars = [
         char
         for char in question
@@ -23,7 +30,28 @@ def relevant(body, question, ratio=0.3):
         return True
 
     hit = sum(1 for char in chars if char in body)
-    return hit >= len(chars) * ratio
+    char_score = hit / len(chars)
+
+    q_bigrams = _char_bigrams(question)
+    # 去掉含停用字的二元组（如"的了""是在"），避免无意义命中
+    q_bigrams = {
+        bg for bg in q_bigrams
+        if bg[0] not in STOP and bg[1] not in STOP
+    }
+
+    if q_bigrams:
+        body_bigrams = _char_bigrams(body)
+        shared = q_bigrams & body_bigrams
+        bigram_score = len(shared) / len(q_bigrams)
+    else:
+        shared = set()
+        bigram_score = 0.0
+
+    # 一个词级重合都没有 = 字典页/门户页/垃圾页的典型特征，直接拒绝
+    if not shared:
+        return False
+
+    return max(char_score, bigram_score) >= ratio
 
 
 def title_key(title):
