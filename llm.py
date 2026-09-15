@@ -26,7 +26,10 @@ def ask(prompt, model="qwen-plus"):
         },
         timeout=60,          # 大模型生成慢，超时给足 60 秒
     )
-    resp.raise_for_status()  # 状态码不是 200 就直接抛错，别让错误悄悄溜过去
+    if resp.status_code != 200:
+        # 把服务端的错误正文带出来：4xx 的真实原因（如 Arrearage=欠费）
+        # 都藏在 body 里，只抛裸状态码会把排查者引入歧途
+        raise RuntimeError(f"LLM 接口错误 {resp.status_code}: {resp.text[:200]}")
     # 返回的 JSON 里，回答藏在 choices[0].message.content 这个路径下
     return resp.json()["choices"][0]["message"]["content"]
 

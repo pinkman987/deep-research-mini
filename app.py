@@ -1,5 +1,5 @@
 import streamlit as st
-from research import research, write_report
+from research import research, write_report, knowledge_fallback
 
 st.set_page_config(page_title="DeepResearch-mini", page_icon="🔍", layout="wide")
 st.title("🔍 DeepResearch-mini · 自主搜索型研究 Agent")
@@ -17,10 +17,14 @@ if st.button("开始研究", type="primary", disabled=not question.strip()):
 
     with st.spinner("多轮检索与总结中，约 1-3 分钟…"):
         notes, sources = research(question, log=log)
-        report = write_report(question, notes, sources)
+    log_box.container().empty()    # 先关进度区，spinner 随 with 结束自动消失
 
-    log_box.container().empty()   # 清掉进度日志
-    st.success(f"研究完成，共引用 {len(sources)} 篇来源")
-    st.markdown(report)
-    st.download_button("下载报告 report.md", report.encode("utf-8"),
-                       file_name="report.md", mime="text/markdown")
+    if not sources:
+        st.warning(notes + " 以下为模型基于自身知识的回答，未经联网核实。")
+        st.markdown(knowledge_fallback(question))
+    else:
+        report = write_report(question, notes, sources)
+        st.success(f"研究完成，共引用 {len(sources)} 篇来源")
+        st.markdown(report)
+        st.download_button("下载报告 report.md", report.encode("utf-8"),
+                           file_name="report.md", mime="text/markdown")
