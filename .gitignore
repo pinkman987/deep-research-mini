@@ -4,3 +4,4 @@ __pycache__/
 my_key.txt
 tavily_key.txt
 .idea/
+eval_run.log  
