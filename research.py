@@ -138,7 +138,9 @@ def research(question, max_rounds=3):
 
 
 if __name__ == "__main__":
-    question = "伺服电机过载报警的原因有哪些？"
+    import sys
+    # 运行时带问题就用带的，不带就用默认问题
+    question = sys.argv[1] if len(sys.argv) > 1 else "伺服电机过载报警的原因有哪些？"
     notes, sources = research(question)
     report = write_report(question, notes, sources)
     with open("report.md", "w", encoding="utf-8") as f:
