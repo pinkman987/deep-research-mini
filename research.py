@@ -19,32 +19,33 @@ def _fetch_one(r):
     return r, final_url, body
 
 
-def collect(question, queries, sources, seen, max_new=4):
-    """搜索+抓取一轮；三个提速手段：
+def collect(question, queries, sources, seen, max_new=4, log=print):
+    """搜索+抓取一轮；log 是进度输出函数（终端传 print，网页传界面函数）
+    三个提速手段：
     1. 摘要预筛：snippet 就不相关的页面根本不抓
     2. 并发抓取：候选页面同时抓，耗时=最慢的一篇
     3. 早停：本轮新增够 max_new 篇就不再抓"""
     round_start = len(sources)
     for q in queries:
         if len(sources) - round_start >= max_new:
-            print("  本轮材料已够，提前停止抓取")
+            log("  本轮材料已够，提前停止抓取")
             break
         hits = search(q, max_results=8)
-        print(f"  搜索「{q}」得到 {len(hits)} 条结果")
+        log(f"  搜索「{q}」得到 {len(hits)} 条结果")
         if not hits:
             time.sleep(2)
             hits = search(q, max_results=8)
-            print(f"  重试得到 {len(hits)} 条结果")
+            log(f"  重试得到 {len(hits)} 条结果")
         # 预筛：标题去重 + 摘要相关性，筛出值得抓的候选
         candidates = []
         for r in hits:
             key = "".join(r["title"].split())
             if key in seen:
-                print(f"  跳过（同一篇文章）: {r['title']}")
+                log(f"  跳过（同一篇文章）: {r['title']}")
                 continue
             seen.add(key)
             if not relevant(r["snippet"] + r["title"], question, ratio=0.3):
-                print(f"  淘汰（摘要就不相关）: {r['title']}")
+                log(f"  淘汰（摘要就不相关）: {r['title']}")
                 continue
             candidates.append(r)
             if len(candidates) >= max_new:
@@ -58,10 +59,10 @@ def collect(question, queries, sources, seen, max_new=4):
             if len(body) <= 200:
                 body = r["snippet"]             # 正文抓不到就退而用搜索摘要
             if not relevant(body, question):
-                print(f"  淘汰（相关性不够）: {r['title']}")
+                log(f"  淘汰（相关性不够）: {r['title']}")
                 continue
             sources.append({**r, "body": body})
-            print(f"  有效材料 +1：{r['title']}（{len(body)} 字）")
+            log(f"  有效材料 +1：{r['title']}（{len(body)} 字）")
         time.sleep(0.5)
 
 
@@ -115,25 +116,26 @@ def write_report(question, notes, sources):
     return ask(prompt)
 
 
-def research(question, max_rounds=3):
-    """主循环：搜索→摘要→反思→（不够就换词再搜）→直到结束或轮数用尽"""
+def research(question, max_rounds=3, log=print):
+    """主循环：搜索→摘要→反思→（不够就换词再搜）→直到结束或轮数用尽
+    log 参数把进度输出注入进来：命令行传 print，网页传界面函数"""
     sources, seen, notes = [], set(), ""
     queries = [question]
     for round_no in range(1, max_rounds + 1):
-        print(f"== 第 {round_no} 轮，搜索词：{queries} ==")
+        log(f"== 第 {round_no} 轮，搜索词：{queries} ==")
         before = len(sources)
-        collect(question, queries, sources, seen)
+        collect(question, queries, sources, seen, log=log)
         if len(sources) == before:
-            print("  本轮零新增，下一轮强制换站点搜索")
+            log("  本轮零新增，下一轮强制换站点搜索")
             queries = [question + " site:csdn.net", question + " site:zhihu.com"]
             continue
         notes = summarize(question, sources)
-        print(notes[:200], "...\n")
+        log(notes[:200] + " ...\n")
         done, queries = reflect(question, notes)
         if done:
-            print("模型判断：材料已足够，结束循环")
+            log("模型判断：材料已足够，结束循环")
             break
-        print(f"模型判断：还不够，下一轮搜 {queries}\n")
+        log(f"模型判断：还不够，下一轮搜 {queries}\n")
     return notes, sources
 
 

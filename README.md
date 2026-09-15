@@ -28,10 +28,17 @@
 ```bash
 python -m venv .venv
 .venv\Scripts\activate            # Windows
-pip install requests beautifulsoup4 trafilatura
+pip install requests beautifulsoup4 trafilatura streamlit
 # 配置千问 API Key：设置环境变量 QWEN_API_KEY，或把 Key 写入 my_key.txt
-python research.py
+python research.py                # 命令行模式（可带问题参数：python research.py "你的问题"）
+streamlit run app.py              # Web 界面模式
 ```
+
+## Web 界面
+
+浏览器打开 http://localhost:8501 ：输入研究问题 → 点击"开始研究" →
+实时查看多轮搜索/抓取/反思进度日志 → 自动生成带来源引用的 Markdown 报告，
+支持一键下载。
 
 ## 项目结构
 
@@ -40,6 +47,7 @@ python research.py
 | search_tool.py | 搜索（搜狗 SERP 解析）与网页正文抓取 |
 | llm.py | 千问 OpenAI 兼容接口的裸 HTTP 调用 |
 | research.py | 主循环：摘要、反思、报告生成 |
+| app.py | Streamlit Web 界面（进度日志 + 报告展示与下载） |
 | report.md | 运行产物：研究报告示例 |
 
 ## 工程设计要点
