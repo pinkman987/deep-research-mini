@@ -2,6 +2,7 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from llm import ask
 from search_tool import fetch, search
@@ -54,9 +55,90 @@ def relevant(body, question, ratio=0.3):
     return max(char_score, bigram_score) >= ratio
 
 
+TRACKING_QUERY_KEYS = {
+    "from",
+    "spm",
+    "src",
+    "source",
+    "ref",
+    "referrer",
+}
+
+
+def url_key(url):
+    """URL去重键：去片段、跟踪参数、默认端口及非根路径末尾斜杠。"""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        parts = urlsplit(raw)
+        scheme = parts.scheme.lower()
+        hostname = (parts.hostname or "").lower()
+        port = parts.port
+        if port and not (
+            (scheme == "http" and port == 80)
+            or (scheme == "https" and port == 443)
+        ):
+            netloc = f"{hostname}:{port}"
+        else:
+            netloc = hostname
+
+        path = parts.path or ("/" if netloc else "")
+        if path != "/":
+            path = path.rstrip("/")
+
+        query_items = []
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            lowered = key.lower()
+            if lowered.startswith("utm_") or lowered in TRACKING_QUERY_KEYS:
+                continue
+            query_items.append((key, value))
+        query = urlencode(sorted(query_items))
+
+        return urlunsplit((scheme, netloc, path, query, ""))
+    except ValueError:
+        return raw
+
+
 def title_key(title):
-    """标题去重键：去掉所有空白，空格差异视为同一篇文章。"""
-    return "".join(title.split())
+    """标题去重键：忽略空白和大小写差异。"""
+    return "".join(str(title or "").split()).casefold()
+
+
+def new_seen_state():
+    """为原始URL、最终URL和标题分别维护去重集合。"""
+    return {
+        "raw_urls": set(),
+        "final_urls": set(),
+        "titles": set(),
+    }
+
+
+def mark_raw_url(url, seen):
+    """记录搜索结果原始URL；已出现时返回True。"""
+    key = url_key(url)
+    if key and key in seen["raw_urls"]:
+        return True
+    if key:
+        seen["raw_urls"].add(key)
+    return False
+
+
+def mark_fetched_page(result, final_url, seen):
+    """按最终URL、再按标题去重；返回重复层名称或空字符串。"""
+    final_key = url_key(final_url or result.get("url", ""))
+    if final_key and final_key in seen["final_urls"]:
+        return "最终URL"
+    if final_key:
+        seen["final_urls"].add(final_key)
+
+    normalized_title = title_key(result.get("title", ""))
+    if normalized_title and normalized_title in seen["titles"]:
+        return "标题"
+    if normalized_title:
+        seen["titles"].add(normalized_title)
+    return ""
 
 
 def _fetch_one(result):
@@ -98,13 +180,9 @@ def collect(
         candidates = []
 
         for result in hits:
-            key = title_key(result["title"])
-
-            if key in seen:
-                log(f"  跳过（同一篇文章）: {result['title']}")
+            if mark_raw_url(result.get("url", ""), seen):
+                log(f"  跳过（原始URL重复）: {result['title']}")
                 continue
-
-            seen.add(key)
 
             preview = result["snippet"] + result["title"]
 
@@ -144,12 +222,8 @@ def collect(
                 )
 
                 for result in backup_hits:
-                    key = title_key(result["title"])
-
-                    if key in seen:
+                    if mark_raw_url(result.get("url", ""), seen):
                         continue
-
-                    seen.add(key)
 
                     preview = result["snippet"] + result["title"]
 
@@ -173,6 +247,14 @@ def collect(
             )
 
         for result, final_url, body in fetched_results:
+            duplicate_layer = mark_fetched_page(result, final_url, seen)
+            if duplicate_layer:
+                log(
+                    f"  跳过（{duplicate_layer}重复）: "
+                    f"{result['title']}"
+                )
+                continue
+
             if final_url:
                 result = {
                     **result,
@@ -465,7 +547,7 @@ def research(
 ):
     """执行搜索、摘要、反思和补充检索循环。"""
     sources = []
-    seen = set()
+    seen = new_seen_state()
     notes = ""
 
     queries = plan_queries(question)
