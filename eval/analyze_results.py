@@ -40,6 +40,16 @@ def summarize(rows, label):
     )
     durations = [r["duration_seconds"] for r in completed]
     source_counts = [r["checks"]["source_count"] for r in answer_rows]
+    # 报告级引用校验（仅适用于有来源的报告）
+    report_rows = [
+        r for r in completed
+        if r["checks"].get("report_citation_pass") is not None
+    ]
+    report_cite_ok = sum(
+        1
+        for r in report_rows
+        if r["checks"].get("report_citation_pass") is True
+    )
 
     print(f"\n===== {label}（{total} 题）=====")
     print(f"报告生成成功率: {len(completed)}/{total}")
@@ -47,6 +57,11 @@ def summarize(rows, label):
         print(f"关键点命中率: {point_hit}/{point_total} = {point_hit / point_total:.1%}")
     print(f"引用编号有效率: {citation_ok}/{len(completed)} = {citation_ok / len(completed):.1%}")
     print(f"无效引用明细: {invalid_all if invalid_all else '无'}")
+    if report_rows:
+        print(
+            f"报告级引用校验通过率: {report_cite_ok}/{len(report_rows)} = "
+            f"{report_cite_ok / len(report_rows):.1%}"
+        )
     if honesty_rows:
         print(
             f"无材料/对抗/模糊题诚实处理率: {insufficient_ok}/{len(honesty_rows)} = "

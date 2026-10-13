@@ -11,7 +11,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from research import knowledge_fallback, research, write_report
+from research import (
+    knowledge_fallback,
+    research,
+    validate_citations,
+    write_report,
+)
 
 
 EVAL_DIR = Path(__file__).resolve().parent
@@ -75,6 +80,17 @@ def check_result(case, report, sources):
         # 模糊问题暂时需要人工判断
         behavior_pass = None
 
+    # 报告级引用校验（与 research.py 的 __main__ 保持一致）：
+    # 1) 引用编号不超出来源总数；2) 结论行必须挂引用。
+    # 无来源（诚实兜底）时不适用，置 None。
+    report_citation_issues = []
+    report_citation_pass = None
+    if source_count > 0:
+        report_citation_issues = validate_citations(
+            report, source_count
+        )
+        report_citation_pass = len(report_citation_issues) == 0
+
     return {
         "source_count": source_count,
         "min_sources_pass": source_count >= minimum_sources,
@@ -85,6 +101,8 @@ def check_result(case, report, sources):
         "citation_numbers": citation_numbers,
         "invalid_citations": invalid_citations,
         "citation_number_pass": len(invalid_citations) == 0,
+        "report_citation_pass": report_citation_pass,
+        "report_citation_issues": report_citation_issues,
     }
 
 

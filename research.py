@@ -1,7 +1,7 @@
 import json
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from llm import ask
@@ -241,10 +241,21 @@ def collect(
         if not candidates:
             continue
 
+        # 用 as_completed + 单条 try 隔离线程异常：任一页面抓取失败
+        # 不应拖垮整批候选（pool.map 会整体抛错）。
+        fetched_results = []
         with ThreadPoolExecutor(max_workers=4) as pool:
-            fetched_results = list(
-                pool.map(_fetch_one, candidates)
-            )
+            futures = [
+                pool.submit(_fetch_one, candidate)
+                for candidate in candidates
+            ]
+            for future in as_completed(futures):
+                try:
+                    fetched_results.append(future.result())
+                except Exception as exc:
+                    log(
+                        f"  抓取线程异常：{type(exc).__name__}: {exc}"
+                    )
 
         for result, final_url, body in fetched_results:
             duplicate_layer = mark_fetched_page(result, final_url, seen)
@@ -286,6 +297,78 @@ def _normalize_text(text):
     return "".join(str(text).split()).lower()
 
 
+def _extract_json_block(answer, bracket):
+    """从模型回答中定位并截取 JSON 片段（首个开括号到末个闭括号）。
+
+    模型可能混入思考文字或 Markdown 代码块，直接解析全量文本容易失败；
+    先按括号定位截取，能显著提高解析成功率。
+    """
+    if bracket == "[":
+        start, end = answer.find("["), answer.rfind("]")
+    else:
+        start, end = answer.find("{"), answer.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return answer[start:end + 1]
+
+
+def _ask_json(prompt, bracket, retries=1):
+    """请求模型输出 JSON；解析失败时把解析错误喂回模型重试。
+
+    返回 (data, status)：
+      status="ok"          解析成功；
+      status="no_block"    回答中没有可提取的 JSON 片段；
+      status="parse_error" 重试后仍解析失败。
+    """
+    answer = ask(prompt)
+    for attempt in range(retries + 1):
+        block = _extract_json_block(answer, bracket)
+        if block is None:
+            return None, "no_block"
+        try:
+            return json.loads(block), "ok"
+        except json.JSONDecodeError as error:
+            if attempt == retries:
+                return None, "parse_error"
+            answer = ask(
+                prompt
+                + "\n\n你上一次的输出不是合法 JSON，解析错误："
+                + f"{error}\n请只输出修正后的 JSON，不要输出任何解释文字。"
+            )
+    return None, "parse_error"
+
+
+def _append_claims(notes, new_notes, seen_claims):
+    """把本轮新产生的已验证结论追加到 notes，并按结论文本跨轮去重。
+
+    返回 (合并后的 notes, 是否新增了结论)。
+    """
+    blocks = []
+    current = None
+    for line in str(new_notes or "").splitlines():
+        if line.startswith("- 结论："):
+            current = [line]
+            blocks.append(current)
+        elif current is not None:
+            current.append(line)
+
+    added_blocks = []
+    for block in blocks:
+        claim = block[0][len("- 结论："):].split(" [", 1)[0].strip()
+        key = _normalize_text(claim)
+        if key in seen_claims:
+            continue
+        seen_claims.add(key)
+        added_blocks.append("\n".join(block))
+
+    if not added_blocks:
+        return notes, False
+
+    addition = "\n".join(added_blocks)
+    merged = (notes + "\n" + addition).strip() if notes else addition
+    return merged, True
+
+
 def summarize(question, sources):
     """提取直接回答问题、且能通过原文验证的结论。"""
     materials = ""
@@ -321,18 +404,12 @@ def summarize(question, sources):
         '"source_id":1,"evidence":"材料中的连续原文"}]}'
     )
 
-    answer = ask(prompt)
+    data, status = _ask_json(prompt, "{", retries=1)
 
-    start = answer.find("{")
-    end = answer.rfind("}")
-
-    if start == -1 or end == -1 or end <= start:
-        return "材料不足：模型没有返回可解析的证据结构。"
-
-    try:
-        data = json.loads(answer[start:end + 1])
-    except json.JSONDecodeError:
+    if status == "parse_error":
         return "材料不足：模型返回的证据JSON格式错误。"
+    if status == "no_block" or data is None:
+        return "材料不足：模型没有返回可解析的证据结构。"
 
     validated_claims = []
     seen_claims = set()
@@ -399,27 +476,19 @@ def plan_queries(question):
         '示例：["伺服过载 故障手册", "伺服过载 报警代码"]。'
     )
 
-    answer = ask(prompt)
-    start = answer.find("[")
-    end = answer.rfind("]")
+    data, _ = _ask_json(prompt, "[", retries=1)
 
-    try:
-        queries = json.loads(answer[start:end + 1])
+    if isinstance(data, list) and data:
+        cleaned_queries = []
 
-        if isinstance(queries, list) and queries:
-            cleaned_queries = []
+        for query in data[:3]:
+            query = str(query).strip().replace("/", " ")
 
-            for query in queries[:3]:
-                query = str(query).strip().replace("/", " ")
+            if query:
+                cleaned_queries.append(query)
 
-                if query:
-                    cleaned_queries.append(query)
-
-            if cleaned_queries:
-                return cleaned_queries
-
-    except Exception:
-        pass
+        if cleaned_queries:
+            return cleaned_queries
 
     return [question]
 
@@ -444,16 +513,9 @@ def reflect(question, notes):
         "只输出JSON，不要输出其他文字。"
     )
 
-    answer = ask(prompt)
-    start = answer.find("{")
-    end = answer.rfind("}")
+    data, _ = _ask_json(prompt, "{", retries=1)
 
-    if start == -1 or end == -1 or end <= start:
-        return False, [question]
-
-    try:
-        data = json.loads(answer[start:end + 1])
-    except json.JSONDecodeError:
+    if not isinstance(data, dict):
         return False, [question]
 
     queries = data.get("queries", [])
@@ -549,6 +611,7 @@ def research(
     sources = []
     seen = new_seen_state()
     notes = ""
+    seen_claims = set()
 
     queries = plan_queries(question)
     log(f"规划搜索词：{queries}")
@@ -573,8 +636,17 @@ def research(
             log("  本轮零新增，下一轮反思会重新规划搜索词")
 
         if sources:
-            notes = summarize(question, sources)
-            log(notes[:200] + " ...\n")
+            # 只对本轮新增材料做摘要（增量总结），避免每轮全量重跑
+            # 导致上下文与 token 成本随轮次线性膨胀。
+            new_sources = sources[before:]
+            if new_sources:
+                new_notes = summarize(question, new_sources)
+                log((new_notes or "材料不足")[:200] + " ...\n")
+                notes, added = _append_claims(
+                    notes, new_notes, seen_claims
+                )
+                if not added:
+                    log("  本轮新增材料未产生新的已验证结论")
 
         done, new_queries = reflect(question, notes)
 
