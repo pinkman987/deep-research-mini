@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6,6 +7,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from llm import ask
 from search_tool import fetch, search
+
+logger = logging.getLogger(__name__)
 
 
 # 疑问词和虚词黑名单
@@ -303,6 +306,8 @@ def _extract_json_block(answer, bracket):
     模型可能混入思考文字或 Markdown 代码块，直接解析全量文本容易失败；
     先按括号定位截取，能显著提高解析成功率。
     """
+    if not isinstance(answer, str):
+        return None
     if bracket == "[":
         start, end = answer.find("["), answer.rfind("]")
     else:
@@ -319,27 +324,37 @@ def _ask_json(prompt, bracket, retries=1):
       status="ok"          解析成功；
       status="no_block"    回答中没有可提取的 JSON 片段；
       status="parse_error" 重试后仍解析失败。
+      status="request_error" 模型请求失败。
     """
-    answer = ask(prompt)
+    request_prompt = prompt
     for attempt in range(retries + 1):
+        try:
+            answer = ask(request_prompt)
+        except Exception as exc:
+            logger.warning("JSON 模型请求失败：%s", type(exc).__name__)
+            return None, "request_error"
         block = _extract_json_block(answer, bracket)
         if block is None:
-            return None, "no_block"
-        try:
-            return json.loads(block), "ok"
-        except json.JSONDecodeError as error:
-            if attempt == retries:
-                return None, "parse_error"
-            answer = ask(
-                prompt
-                + "\n\n你上一次的输出不是合法 JSON，解析错误："
-                + f"{error}\n请只输出修正后的 JSON，不要输出任何解释文字。"
-            )
+            status, error_text = "no_block", "没有找到可解析的 JSON 片段"
+        else:
+            try:
+                return json.loads(block), "ok"
+            except json.JSONDecodeError as error:
+                status, error_text = "parse_error", str(error)
+        if attempt == retries:
+            return None, status
+        request_prompt = (
+            prompt
+            + "\n\n你上一次的输出不是合法 JSON，解析错误："
+            + error_text
+            + f"\n上一次输出：\n{str(answer)[:4000]}"
+            + "\n请只输出修正后的 JSON，不要输出任何解释文字。"
+        )
     return None, "parse_error"
 
 
 def _append_claims(notes, new_notes, seen_claims):
-    """把本轮新产生的已验证结论追加到 notes，并按结论文本跨轮去重。
+    """追加已验证结论，按结论文本与全局来源编号跨轮去重。
 
     返回 (合并后的 notes, 是否新增了结论)。
     """
@@ -354,8 +369,10 @@ def _append_claims(notes, new_notes, seen_claims):
 
     added_blocks = []
     for block in blocks:
-        claim = block[0][len("- 结论："):].split(" [", 1)[0].strip()
-        key = _normalize_text(claim)
+        claim_line = block[0][len("- 结论："):]
+        citations = tuple(sorted(set(re.findall(r"\[(\d+)\]", claim_line))))
+        claim = re.sub(r"(?:\s+\[\d+\])+$", "", claim_line).strip()
+        key = (_normalize_text(claim), citations)
         if key in seen_claims:
             continue
         seen_claims.add(key)
@@ -369,11 +386,11 @@ def _append_claims(notes, new_notes, seen_claims):
     return merged, True
 
 
-def summarize(question, sources):
-    """提取直接回答问题、且能通过原文验证的结论。"""
+def summarize(question, sources, source_offset=0):
+    """验证新增材料中的结论；source_offset 保持全局引用编号一致。"""
     materials = ""
 
-    for index, source in enumerate(sources, start=1):
+    for index, source in enumerate(sources, start=source_offset + 1):
         materials += (
             f"[{index}] 标题：{source['title']}\n"
             f"正文：{source['body'][:3000]}\n\n"
@@ -401,22 +418,33 @@ def summarize(question, sources):
         "11. 找不到直接回答问题的证据时，输出："
         '{"claims":[]}。\n'
         '输出格式：{"claims":[{"claim":"结论",'
-        '"source_id":1,"evidence":"材料中的连续原文"}]}'
+        f'"source_id":{source_offset + 1},'
+        '"evidence":"材料中的连续原文"}]}'
     )
 
     data, status = _ask_json(prompt, "{", retries=1)
 
     if status == "parse_error":
         return "材料不足：模型返回的证据JSON格式错误。"
+    if status == "request_error":
+        return "材料不足：模型服务不可用，未能提取验证结论。"
     if status == "no_block" or data is None:
         return "材料不足：模型没有返回可解析的证据结构。"
+
+    if not isinstance(data, dict) or not isinstance(data.get("claims"), list):
+        return "材料不足：模型返回的证据JSON结构错误。"
 
     validated_claims = []
     seen_claims = set()
 
     for item in data.get("claims", []):
-        claim = str(item.get("claim", "")).strip()
-        evidence = str(item.get("evidence", "")).strip()
+        if not isinstance(item, dict):
+            continue
+        claim = item.get("claim", "")
+        evidence = item.get("evidence", "")
+        if not isinstance(claim, str) or not isinstance(evidence, str):
+            continue
+        claim, evidence = claim.strip(), evidence.strip()
 
         try:
             source_id = int(item.get("source_id"))
@@ -426,12 +454,13 @@ def summarize(question, sources):
         if not claim or not evidence:
             continue
 
-        if source_id < 1 or source_id > len(sources):
+        source_index = source_id - source_offset - 1
+        if source_index < 0 or source_index >= len(sources):
             continue
 
         normalized_evidence = _normalize_text(evidence)
         normalized_body = _normalize_text(
-            sources[source_id - 1].get("body", "")
+            sources[source_index].get("body", "")
         )
 
         # 证据过短时容易出现偶然匹配
@@ -442,7 +471,7 @@ def summarize(question, sources):
         if normalized_evidence not in normalized_body:
             continue
 
-        normalized_claim = _normalize_text(claim)
+        normalized_claim = (_normalize_text(claim), source_id)
 
         if normalized_claim in seen_claims:
             continue
@@ -640,7 +669,7 @@ def research(
             # 导致上下文与 token 成本随轮次线性膨胀。
             new_sources = sources[before:]
             if new_sources:
-                new_notes = summarize(question, new_sources)
+                new_notes = summarize(question, new_sources, source_offset=before)
                 log((new_notes or "材料不足")[:200] + " ...\n")
                 notes, added = _append_claims(
                     notes, new_notes, seen_claims
